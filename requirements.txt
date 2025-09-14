@@ -1,4 +1,6 @@
-Flask==2.2.5
-requests 
-protobuf==4.21.12
+
+Flask
+requests
+pycryptodome
+protobuf
 protobuf-decoder
