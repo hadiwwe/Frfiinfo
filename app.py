@@ -1,193 +1,275 @@
-import asyncio
-import time
-import httpx
-import json
-from collections import defaultdict
-from functools import wraps
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from cachetools import TTLCache
-from typing import Tuple
-from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
-from google.protobuf import json_format, message
-from google.protobuf.message import Message
+from flask import Flask, jsonify, request
+import requests
+import binascii
 from Crypto.Cipher import AES
-import base64
-import random
+from Crypto.Util.Padding import pad, unpad
+from protobuf_decoder.protobuf_decoder import Parser
+from datetime import datetime
+import json
 
-# === Settings ===
-MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
-MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
-RELEASEVERSION = "OB49"
-USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
-SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE"}
-
-# === Flask App Setup ===
 app = Flask(__name__)
-CORS(app)
-cache = TTLCache(maxsize=100, ttl=300)
-cached_tokens = defaultdict(dict)
 
-# === Helper Functions ===
-def pad(text: bytes) -> bytes:
-    padding_length = AES.block_size - (len(text) % AES.block_size)
-    return text + bytes([padding_length] * padding_length)
+com_garena_msdk_uid = "3942040791"
+com_garena_msdk_password = "EDD92B8948F4453F544C9432DFB4996D02B4054379A0EE083D8459737C50800B"
+com_jwt_generate_url = "https://100067.vercel.app/token"
 
-def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
-    aes = AES.new(key, AES.MODE_CBC, iv)
-    return aes.encrypt(pad(plaintext))
-
-def decode_protobuf(encoded_data: bytes, message_type: message.Message) -> message.Message:
-    instance = message_type()
-    instance.ParseFromString(encoded_data)
-    return instance
-
-async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
-    json_format.ParseDict(json.loads(json_data), proto_message)
-    return proto_message.SerializeToString()
-
-def get_account_credentials(region: str) -> str:
-    r = region.upper()
-    if r == "IND":
-        return "uid=3692279677&password=473AFFEF67F708CBB0962A958BB2809DA0843EA41BDB70D738FD9527EA04B27B"
-    elif r in {"BR", "US", "SAC", "NA"}:
-        return "uid=3692292847&password=FC22F6812C850FF7D8DB8C5474A106B6FE22CB10C0A6673837216A32675E5649"
-    elif r == "VN":
-        return "uid=3686689562&password=AD9C4A2B51A749481913F72A36F68A9F231520E9AC29B244DB47A64FD7353A12"
-    elif r == "SG":
-        return "uid=3692265171&password=A2A5E3C252A35B2BB30698BD1469A759417A68A069CF6980ED959EB01D352E28"
-    elif r == "ID":
-        return "uid=3692307512&password=4AA06E1DB3F998ABDBDA74578D26B0C84700EC5C079751E7C8F1626048DDBCAE"
-    elif r == "TH":
-        return "uid=3692333198&password=0ED64C5A89E09B8BE538829B0304FE5F5F7EA3BBE645A341C73ECA49143D2211"
-    elif r == "TW":
-        return "uid=3692312456&password=1A062FD700DA8F826AF84A37EE2B62121B79516AF71666949C72FFF42D1C554A"
-    else:
-        try:
-            with open("accounts.txt", "r") as f:
-                lines = [line.strip() for line in f if line.strip()]
-                if not lines:
-                    raise ValueError("File accounts.txt trống.")
-                uid, password = random.choice(lines).split()
-                return f"uid={uid}&password={password}"
-        except Exception as e:
-            return f"ERROR: {e}"
-
-# === Token Generation ===
-async def get_access_token(account: str):
-    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
-    payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
-    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/x-www-form-urlencoded"}
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, data=payload, headers=headers)
-        data = resp.json()
-        return data.get("access_token", "0"), data.get("open_id", "0")
-
-async def create_jwt(region: str):
-    account = get_account_credentials(region)
-    token_val, open_id = await get_access_token(account)
-    body = json.dumps({"open_id": open_id, "open_id_type": "4", "login_token": token_val, "orign_platform_type": "4"})
-    proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
-    payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
-    url = "https://loginbp.ggblueshark.com/MajorLogin"
-    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
-               'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1",
-               'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, data=payload, headers=headers)
-        msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
-        cached_tokens[region] = {
-            'token': f"Bearer {msg.get('token','0')}",
-            'region': msg.get('lockRegion','0'),
-            'server_url': msg.get('serverUrl','0'),
-            'expires_at': time.time() + 25200
+def get_jwt():
+    try:
+        params = {
+            'uid': com_garena_msdk_uid,
+            'password': com_garena_msdk_password
         }
+        response = requests.get(com_jwt_generate_url, params=params)
+        if response.status_code == 200:
+            jwt_data = response.json()
+            return jwt_data.get("token")  
+        return None
+    except Exception as e:
+        print(f"Error fetching JWT: {e}")
+        return None
+        
+def Encrypt_ID(x):
+    x = int(x)
+    dec = ['80', '81', '82', '83', '84', '85', '86', '87', '88', '89', '8a', '8b', '8c', '8d', '8e', '8f', '90', '91', '92', '93', '94', '95', '96', '97', '98', '99', '9a', '9b', '9c', '9d', '9e', '9f', 'a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'aa', 'ab', 'ac', 'ad', 'ae', 'af', 'b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9', 'ba', 'bb', 'bc', 'bd', 'be', 'bf', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'ca', 'cb', 'cc', 'cd', 'ce', 'cf', 'd0', 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8', 'd9', 'da', 'db', 'dc', 'dd', 'de', 'df', 'e0', 'e1', 'e2', 'e3', 'e4', 'e5', 'e6', 'e7', 'e8', 'e9', 'ea', 'eb', 'ec', 'ed', 'ee', 'ef', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'fa', 'fb', 'fc', 'fd', 'fe', 'ff']
+    xxx = ['1', '01', '02', '03', '04', '05', '06', '07', '08', '09', '0a', '0b', '0c', '0d', '0e', '0f', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '1a', '1b', '1c', '1d', '1e', '1f', '20', '21', '22', '23', '24', '25', '26', '27', '28', '29', '2a', '2b', '2c', '2d', '2e', '2f', '30', '31', '32', '33', '34', '35', '36', '37', '38', '39', '3a', '3b', '3c', '3d', '3e', '3f', '40', '41', '42', '43', '44', '45', '46', '47', '48', '49', '4a', '4b', '4c', '4d', '4e', '4f', '50', '51', '52', '53', '54', '55', '56', '57', '58', '59', '5a', '5b', '5c', '5d', '5e', '5f', '60', '61', '62', '63', '64', '65', '66', '67', '68', '69', '6a', '6b', '6c', '6d', '6e', '6f', '70', '71', '72', '73', '74', '75', '76', '77', '78', '79', '7a', '7b', '7c', '7d', '7e', '7f']
+    x = x / 128
+    if x > 128:
+        x = x / 128
+        if x > 128:
+            x = x / 128
+            if x > 128:
+                x = x / 128
+                strx = int(x)
+                y = (x - int(strx)) * 128
+                stry = str(int(y))
+                z = (y - int(stry)) * 128
+                strz = str(int(z))
+                n = (z - int(strz)) * 128
+                strn = str(int(n))
+                m = (n - int(strn)) * 128
+                return dec[int(m)] + dec[int(n)] + dec[int(z)] + dec[int(y)] + xxx[int(x)]
+            else:
+                strx = int(x)
+                y = (x - int(strx)) * 128
+                stry = str(int(y))
+                z = (y - int(stry)) * 128
+                strz = str(int(z))
+                n = (z - int(strz)) * 128
+                strn = str(int(n))
+                return dec[int(n)] + dec[int(z)] + dec[int(y)] + xxx[int(x)]
 
-async def initialize_tokens():
-    tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
-    await asyncio.gather(*tasks)
+def encrypt_api(plain_text):
+    plain_text = bytes.fromhex(plain_text)
+    key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+    iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    cipher_text = cipher.encrypt(pad(plain_text, AES.block_size))
+    return cipher_text.hex()
 
-async def refresh_tokens_periodically():
-    while True:
-        await asyncio.sleep(25200)
-        await initialize_tokens()
+def parse_results(parsed_results):
+    result_dict = {}
+    for result in parsed_results:
+        field_data = {}
+        field_data['wire_type'] = result.wire_type
+        if result.wire_type == "varint":
+            field_data['data'] = result.data
+            result_dict[result.field] = field_data
+        elif result.wire_type == "string":
+            field_data['data'] = result.data
+            result_dict[result.field] = field_data
+        elif result.wire_type == 'length_delimited':
+            field_data["data"] = parse_results(result.data.results)
+            result_dict[result.field] = field_data
+    return result_dict
 
-async def get_token_info(region: str) -> Tuple[str,str,str]:
-    info = cached_tokens.get(region)
-    if info and time.time() < info['expires_at']:
-        return info['token'], info['region'], info['server_url']
-    await create_jwt(region)
-    info = cached_tokens[region]
-    return info['token'], info['region'], info['server_url']
+def get_available_room(input_text):
+    parsed_results = Parser().parse(input_text)
+    parsed_results_dict = parse_results(parsed_results)
+    return json.dumps(parsed_results_dict)
 
-async def GetAccountInformation(uid, unk, region, endpoint):
-    region = region.upper()
-    if region not in SUPPORTED_REGIONS:
-        raise ValueError(f"Unsupported region: {region}")
-    payload = await json_to_proto(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
-    data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
-    token, lock, server = await get_token_info(region)
-    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
-               'Content-Type': "application/octet-stream", 'Expect': "100-continue",
-               'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1",
-               'ReleaseVersion': RELEASEVERSION}
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(server+endpoint, data=data_enc, headers=headers)
-        return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
+@app.route('/')
+def index():
+    return jsonify({
+        "FF Information": [
+            {
+                "credits": "Ujjaiwal"
+            }
+        ]
+    })
 
-# === Caching Decorator ===
-def cached_endpoint(ttl=300):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*a, **k):
-            key = (request.path, tuple(request.args.items()))
-            if key in cache:
-                return cache[key]
-            res = fn(*a, **k)
-            cache[key] = res
-            return res
-        return wrapper
-    return decorator
-
-# === Flask Routes ===
-@app.route('/player-info')
-@cached_endpoint()
-def get_account_info():
-    region = request.args.get('region')
-    uid = request.args.get('uid')
-
-    # Pehle basic validation
-    if not uid:
-        return jsonify({"error": "Please provide UID."}), 400
-
-    if not region:
-        return jsonify({"error": "Please provide REGION."}), 400
-
+@app.route('/info', methods=['GET'])
+def get_player_info():
     try:
-        # API call
-        return_data = asyncio.run(GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow"))
+        player_id = request.args.get('uid')
+        if not player_id:
+            return jsonify({
+                "Error": [
+                    {
+                        "message": "Player ID is required"
+                    }
+                ]
+            }), 400
 
-        # Agar data mila toh usko beautify karke bhejo
-        formatted_json = json.dumps(return_data, indent=2, ensure_ascii=False)
-        return formatted_json, 200, {'Content-Type': 'application/json; charset=utf-8'}
+        jwt_token = get_jwt()
+        if not jwt_token:
+            return jsonify({
+                "Error": [
+                    {
+                        "message": "Failed to fetch JWT token"
+                    }
+                ]
+            }), 500
+
+        data = bytes.fromhex(encrypt_api(f"08{Encrypt_ID(player_id)}1007"))
+        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+        headers = {
+            'X-Unity-Version': '2018.4.11f1',
+            'ReleaseVersion': 'OB50', 
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-GA': 'v1 1',
+            'Authorization': f'Bearer {jwt_token}',
+            'Content-Length': '16',
+            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 7.1.2; ASUS_Z01QD Build/QKQ1.190825.002)',
+            'Host': 'clientbp.ggblueshark.com',
+            'Connection': 'Keep-Alive',
+            'Accept-Encoding': 'gzip'
+        }
+        response = requests.post(url, headers=headers, data=data, verify=False)
+
+        if response.status_code == 200:
+            hex_response = binascii.hexlify(response.content).decode('utf-8')
+            json_result = get_available_room(hex_response)
+            parsed_data = json.loads(json_result)
+
+            try:
+                basic_info = parsed_data.get("1", {}).get("data", {})
+                profile_info = parsed_data.get("2", {}).get("data", {})
+                clan_info = parsed_data.get("6", {}).get("data", {})
+                captain_info = parsed_data.get("7", {}).get("data", {})
+                pet_info = parsed_data.get("8", {}).get("data", {})
+                social_info = parsed_data.get("9", {}).get("data", {}) 
+                diamond_cost = parsed_data.get("10", {}).get("data", {})
+                credit_score_info = parsed_data.get("11", {}).get("data", {})
+                external_icon_info = basic_info.get("49", {}).get("data", {})
+
+                player_data = {
+                    "AccountInfo": {
+                        "AccountBadgeCnt": basic_info.get("18", {}).get("data", 0),
+                        "AccountBadgeId": basic_info.get("19", {}).get("data", 0),
+                        "AccountBannerID": basic_info.get("11", {}).get("data", 0),
+                        "AccountEXP": basic_info.get("7", {}).get("data", 0),
+                        "AccountHasElitePass": basic_info.get("17", {}).get("data", False),
+                        "AccountHeadPic": basic_info.get("12", {}).get("data", 0),
+                        "AccountID": player_id,
+                        "AccountLastLoginAt": str(basic_info.get("24", {}).get("data", 0)),
+                        "AccountLevel": basic_info.get("6", {}).get("data", 0),
+                        "AccountLiked": basic_info.get("21", {}).get("data", 0),
+                        "AccountNickname": basic_info.get("3", {}).get("data", ""),
+                        "AccountRank": basic_info.get("14", {}).get("data", 0),
+                        "AccountRankingPoints": basic_info.get("15", {}).get("data", 0),
+                        "AccountRegion": basic_info.get("5", {}).get("data", ""),
+                        "AccountRole": basic_info.get("16", {}).get("data", 0),
+                        "AccountSeasonId": basic_info.get("20", {}).get("data", 0),
+                        "AccountType": basic_info.get("2", {}).get("data", 0),
+                        "CsMaxRank": basic_info.get("36", {}).get("data", 0),
+                        "CsRank": basic_info.get("30", {}).get("data", 0),
+                        "CsRankingPoints": basic_info.get("31", {}).get("data", 0),
+                        "EquippedWeaponSkinShows": basic_info.get("32", {}).get("data", []),
+                        "MaxRank": basic_info.get("35", {}).get("data", 0),
+                        "title": basic_info.get("48", {}).get("data", 0)
+                    },
+                    "AccountProfileInfo": {
+                        "avatarId": profile_info.get("1", {}).get("data", 0),
+                        "clothes": profile_info.get("4", {}).get("data", []),
+                        "equipedSkills": profile_info.get("5", {}).get("data", []),
+                        "pvePrimaryWeapon": profile_info.get("7", {}).get("data", 0),
+                        "endTime": profile_info.get("9", {}).get("data", 0)
+                    },
+                    "captainBasicInfo": {
+                        "accountId": str(captain_info.get("1", {}).get("data", 0)),
+                        "accountType": captain_info.get("2", {}).get("data", 0),
+                        "badgeCnt": captain_info.get("18", {}).get("data", 0),
+                        "badgeId": captain_info.get("19", {}).get("data", 0),
+                        "bannerId": captain_info.get("11", {}).get("data", 0),
+                        "csMaxRank": captain_info.get("36", {}).get("data", 0),
+                        "csRank": captain_info.get("30", {}).get("data", 0),
+                        "csRankingPoints": captain_info.get("31", {}).get("data", 0),
+                        "exp": captain_info.get("7", {}).get("data", 0),
+                        "hasElitePass": captain_info.get("17", {}).get("data", False),
+                        "headPic": captain_info.get("12", {}).get("data", 0),
+                        "lastLoginAt": str(captain_info.get("24", {}).get("data", 0)),
+                        "level": captain_info.get("6", {}).get("data", 0),
+                        "liked": captain_info.get("21", {}).get("data", 0),
+                        "maxRank": captain_info.get("35", {}).get("data", 0),
+                        "nickname": captain_info.get("3", {}).get("data", ""),
+                        "rank": captain_info.get("14", {}).get("data", 0),
+                        "rankingPoints": captain_info.get("15", {}).get("data", 0),
+                        "region": captain_info.get("5", {}).get("data", ""),
+                        "role": captain_info.get("16", {}).get("data", 0),
+                        "seasonId": captain_info.get("20", {}).get("data", 0),
+                        "title": captain_info.get("48", {}).get("data", 0),
+                        "weaponSkinShows": captain_info.get("32", {}).get("data", [])
+                    },
+                    "clanBasicInfo": {
+                        "capacity": clan_info.get("5", {}).get("data", 0),
+                        "captainId": str(clan_info.get("3", {}).get("data", 0)),
+                        "clanId": str(clan_info.get("1", {}).get("data", 0)),
+                        "clanLevel": clan_info.get("4", {}).get("data", 0),
+                        "clanName": clan_info.get("2", {}).get("data", ""),
+                        "memberNum": clan_info.get("6", {}).get("data", 0)
+                    },
+                    "createAt": str(basic_info.get("44", {}).get("data", 0)),
+                    "creditScoreInfo": {
+                        "creditScore": credit_score_info.get("1", {}).get("data", 0),
+                        "periodicSummaryEndTime": str(credit_score_info.get("8", {}).get("data", 0)),
+                        "rewardState": "REWARD_STATE_UNCLAIMED" 
+                    },
+                    "petInfo": {
+                        "exp": pet_info.get("4", {}).get("data", 0),
+                        "id": pet_info.get("1", {}).get("data", 0),
+                        "isSelected": pet_info.get("5", {}).get("data", False),
+                        "level": pet_info.get("3", {}).get("data", 0),
+                        "name": pet_info.get("2", {}).get("data", ""),
+                        "selectedSkillId": pet_info.get("9", {}).get("data", 0),
+                        "skinId": pet_info.get("6", {}).get("data", 0)
+                    },
+                    "releaseVersion": basic_info.get("50", {}).get("data", ""),
+                    "showBrRank": basic_info.get("52", {}).get("data", False),
+                    "showCsRank": basic_info.get("53", {}).get("data", False),
+                    "socialHighLightsWithBasicInfo": {},
+                    "socialInfo": {
+                        "accountId": str(social_info.get("1", {}).get("data", 0)),
+                        "signature": social_info.get("9", {}).get("data", "")
+                    }
+                }
+
+                return jsonify(player_data)
+
+            except Exception as e:
+                return jsonify({
+                    "Error": [
+                        {
+                            "message": f"Failed to parse player information: {str(e)}"
+                        }
+                    ]
+                }), 500
+
+        return jsonify({
+            "Error": [
+                {
+                    "message": f"API request failed with status code: {response.status_code}"
+                }
+            ]
+        }), response.status_code
 
     except Exception as e:
-        # Agar koi error aaye toh yeh catch karega
-        return jsonify({"error": "Invalid UID or Region. Please check and try again."}), 500
-
-@app.route('/refresh', methods=['GET','POST'])
-def refresh_tokens_endpoint():
-    try:
-        asyncio.run(initialize_tokens())
-        return jsonify({'message':'Tokens refreshed for all regions.'}),200
-    except Exception as e:
-        return jsonify({'error': f'Refresh failed: {e}'}),500
-
-# === Startup ===
-async def startup():
-    await initialize_tokens()
-    asyncio.create_task(refresh_tokens_periodically())
+        return jsonify({
+            "Error": [
+                {
+                    "message": f"An unexpected error occurred: {str(e)}"
+                }
+            ]
+        }), 500
 
 if __name__ == '__main__':
-    asyncio.run(startup())
     app.run(host='0.0.0.0', port=5000, debug=True)
